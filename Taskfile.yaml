@@ -1,0 +1,20 @@
+version: '3'
+
+tasks:
+  dev:
+    desc: Run both the frontend and backend servers concurrently
+    deps: [build-frontend]
+    cmds:
+      - cargo run --bin frappe-net
+      
+  build-frontend:
+    desc: Build the WASM bundle for the Dioxus app
+    dir: frappe-desk-ui
+    cmds:
+      - dioxus build --release
+
+  test:
+    desc: Run unit tests for all domain packages
+    dir: erpnext-domain
+    cmds:
+      - cargo test --workspace

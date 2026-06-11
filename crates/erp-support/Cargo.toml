@@ -1,0 +1,16 @@
+[package]
+name = "erp-support"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+rust_decimal = { version = "=1.42.0", features = ["maths", "serde"] }
+rust_decimal_macros = "1.36.0"
+serde = { version = "1.0", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1.0"
+tokio = { version = "1.52.3", features = ["full"] }
+base64 = "0.22.1"
+frappe-storage = { path = "../frappe-storage" }
+futures = "0.3"
+uuid = { version = "1.8", features = ["v4"] }

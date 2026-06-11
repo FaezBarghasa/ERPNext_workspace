@@ -1,0 +1,9 @@
+[package]
+name = "erp-inventory"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+surrealdb = { version = "2.1", features = ["kv-mem"] }
+tokio = { version = "1.40", features = ["full"] }

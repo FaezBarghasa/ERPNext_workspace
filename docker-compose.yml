@@ -1,0 +1,23 @@
+version: '3.8'
+
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:latest
+    ports:
+      - "8000:8000"
+    command: start --log trace --user root --pass root memory
+
+  frappe-gateway:
+    build: 
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+      - "4433:4433/udp" # HTTP/3 QUIC
+    depends_on:
+      - surrealdb
+    environment:
+      - RUST_LOG=info
+      - DB_HOST=surrealdb:8000
+    volumes:
+      - ./frappe-desk-ui/dist:/app/dist # Serve WASM bundle statically
