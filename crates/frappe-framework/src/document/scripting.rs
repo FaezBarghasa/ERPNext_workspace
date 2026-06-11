@@ -87,3 +87,29 @@ impl ScriptingEngine {
         Ok(Value::Object(mutated_doc))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn test_execute_lifecycle() {
+        let engine = ScriptingEngine::new();
+        let doc = json!({
+            "base": 1000,
+            "status": "Draft",
+        });
+
+        let script = r#"
+            doc.base = doc.base * 2;
+            doc.status = "Approved";
+            doc
+        "#;
+
+        let result = engine.execute_lifecycle("test_script", script, doc).unwrap();
+        assert_eq!(result["base"].as_i64(), Some(2000));
+        assert_eq!(result["status"].as_str(), Some("Approved"));
+    }
+}
+
