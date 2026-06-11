@@ -12,6 +12,8 @@ members = [
     "crates/erp-learning",
     "crates/erp-crm",
     "crates/erp-hr",
-    "crates/frappe-storage"
-, "crates/desk-app", "crates/desk-components"]
+    "crates/frappe-storage",
+    "crates/desk-app",
+    "crates/desk-components"
+]
 resolver = "2"
