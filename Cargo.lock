@@ -2167,7 +2167,9 @@ checksum = "877a4ace8713b0bcf2a4e7eec82529c029f1d0619886d18145fea96c3ffe5c0f"
 name = "erp-accounting"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "rust_decimal",
+ "rust_decimal_macros",
  "serde",
  "serde_json",
  "surrealdb",
@@ -2216,7 +2218,11 @@ dependencies = [
 name = "erp-inventory"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "rust_decimal",
+ "rust_decimal_macros",
  "serde",
+ "serde_json",
  "surrealdb",
  "tokio",
 ]
