@@ -1,0 +1,22 @@
+[package]
+name = "rbench"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "rbench"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio = { version = "1.40", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+toml = "0.8"
+surrealdb = { version = "3.0.5", features = ["kv-mem", "kv-rocksdb"] }
+chrono = { version = "0.4", features = ["serde"] }
+anyhow = "1.0"
+colored = "3.0"
+indicatif = "0.17"
+dirs = "5.0"
+uuid = { version = "1.8", features = ["v4"] }

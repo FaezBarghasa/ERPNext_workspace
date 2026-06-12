@@ -2271,7 +2271,9 @@ dependencies = [
  "rust_decimal",
  "rust_decimal_macros",
  "serde",
- "thiserror 1.0.69",
+ "serde_json",
+ "surrealdb",
+ "thiserror 2.0.18",
  "tokio",
  "uuid",
 ]
