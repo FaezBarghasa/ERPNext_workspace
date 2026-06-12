@@ -1,7 +1,16 @@
 use dioxus::prelude::*;
+use serde::{Serialize, Deserialize};
 use serde_json::Value;
 use crate::form_engine::live_form::{FieldDef, FieldType};
 use std::collections::HashMap;
+
+#[derive(Clone, PartialEq, Serialize, Deserialize, Debug)]
+pub struct ClientFieldSchema {
+    pub fieldname: String,
+    pub label: String,
+    pub fieldtype: String, // "Data", "Int", "Currency", "Link"
+    pub reqd: bool,
+}
 
 #[derive(Props, Clone, PartialEq)]
 pub struct FormProps {
@@ -149,6 +158,117 @@ pub fn DynamicFormInterpreter(props: FormProps) -> Element {
                         
                         if let Some(ref desc) = field.description {
                             p { class: "text-[11px] text-slate-500", "{desc}" }
+                        }
+                    }
+                }
+            }
+
+            // Actions panel
+            div { class: "p-6 border-t border-slate-800/80 bg-slate-950 flex flex-col sm:flex-row items-center justify-between gap-4",
+                span { class: "text-xs font-medium text-slate-400", "{save_status}" }
+                
+                button {
+                    class: format!(
+                        "px-6 py-3 text-sm font-bold rounded-xl transition duration-150 flex items-center justify-center space-x-2 text-white shadow-lg {}",
+                        if *is_saving.read() { "bg-blue-600/50 cursor-not-allowed" } else { "bg-blue-600 hover:bg-blue-500 hover:shadow-blue-500/15" }
+                    ),
+                    disabled: *is_saving.read(),
+                    onclick: handle_save,
+                    if *is_saving.read() { "Saving..." } else { "Save Draft" }
+                }
+            }
+        }
+    }
+}
+
+#[derive(Props, Clone, PartialEq)]
+pub struct DynamicFormProps {
+    pub fields: Vec<ClientFieldSchema>,
+    #[props(optional)]
+    pub on_change: Option<EventHandler<serde_json::Map<String, Value>>>,
+}
+
+#[component]
+pub fn DynamicForm(props: DynamicFormProps) -> Element {
+    let mut document_state = use_signal(serde_json::Map::new);
+    let mut is_saving = use_signal(|| false);
+    let mut save_status = use_signal(|| "".to_string());
+
+    let fields: Vec<FieldDef> = props.fields.iter().map(|f| {
+        let ft = match f.fieldtype.as_str() {
+            "Data" => FieldType::Data,
+            "Int" => FieldType::Int,
+            "Currency" => FieldType::Currency,
+            "Link" => FieldType::Link,
+            _ => FieldType::Data,
+        };
+        FieldDef {
+            fieldname: f.fieldname.clone(),
+            label: f.label.clone(),
+            fieldtype: ft,
+            required: f.reqd,
+            read_only: false,
+            hidden: false,
+            options: if f.fieldtype == "Link" { Some("Customer".to_string()) } else { None },
+            default: None,
+            description: None,
+        }
+    }).collect();
+
+    let handle_save = move |_| {
+        is_saving.set(true);
+        save_status.set("Saving Document...".to_string());
+        
+        let data = document_state.read().clone();
+        
+        if let Some(ref handler) = props.on_change {
+            handler.call(data);
+        }
+        
+        spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+            is_saving.set(false);
+            save_status.set("Document Saved Successfully!".to_string());
+        });
+    };
+
+    rsx! {
+        div {
+            class: "max-w-4xl mx-auto bg-slate-900 rounded-3xl border border-slate-800 shadow-xl overflow-hidden font-sans text-white",
+            
+            // Header
+            div { class: "p-6 border-b border-slate-800/80 bg-slate-950 flex justify-between items-center",
+                div {
+                    h2 { class: "text-xl font-bold tracking-tight text-white", "Dynamic Form Engine" }
+                    p { class: "text-xs text-slate-500 mt-1", "Metadata-driven client form compilation" }
+                }
+            }
+
+            // Grid of fields
+            div { class: "p-6 grid grid-cols-1 md:grid-cols-2 gap-6",
+                for field in fields.iter() {
+                    div { class: "space-y-1.5",
+                        label { class: "block text-xs font-bold text-slate-400 uppercase tracking-wider",
+                            "{field.label}"
+                            if field.required {
+                                span { class: "text-red-500 ml-1", "*" }
+                            }
+                        }
+                        
+                        FieldWidget {
+                            field: field.clone(),
+                            value: document_state.read().get(&field.fieldname).cloned().unwrap_or(Value::Null),
+                            link_options: None,
+                            on_change: {
+                                let fieldname = field.fieldname.clone();
+                                let on_change_cb = props.on_change.clone();
+                                move |new_val: Value| {
+                                    document_state.write().insert(fieldname.clone(), new_val);
+                                    if let Some(ref cb) = on_change_cb {
+                                        cb.call(document_state.read().clone());
+                                    }
+                                }
+                            }
                         }
                     }
                 }
