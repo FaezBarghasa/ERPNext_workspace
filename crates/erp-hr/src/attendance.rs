@@ -63,3 +63,98 @@ pub fn is_within_location(
 
     distance <= threshold_meters
 }
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct AttendanceRecord {
+    pub employee_id: String,
+    pub date: chrono::NaiveDate,
+    pub clock_in: DateTime<Utc>,
+    pub clock_out: Option<DateTime<Utc>>,
+    pub status: String, // "Present", "Absent", "Half Day"
+}
+
+pub async fn record_factory_clock_in(
+    db: &surrealdb::Surreal<surrealdb::engine::any::Any>,
+    employee_id: String,
+    lat: Decimal,
+    lon: Decimal,
+    factory_lat: Decimal,
+    factory_lon: Decimal,
+    threshold_meters: Decimal,
+) -> Result<bool, String> {
+    let now = Utc::now();
+    let log = BiometricLog {
+        employee_id: employee_id.clone(),
+        timestamp: now,
+        lat,
+        lon,
+    };
+
+    let within_geofence = is_within_location(&log, factory_lat, factory_lon, threshold_meters);
+
+    if within_geofence {
+        let date = now.date_naive();
+        // Check if there is an existing attendance record for today
+        let query_check = "SELECT * FROM tabAttendance WHERE employee_id = $emp AND date = $date LIMIT 1;";
+        let mut check_res = db.query(query_check)
+            .bind(("emp", employee_id.clone()))
+            .bind(("date", date))
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let existing_vals: Vec<serde_json::Value> = check_res.take(0).map_err(|e| e.to_string())?;
+        let existing: Vec<AttendanceRecord> = existing_vals.into_iter()
+            .map(|v| serde_json::from_value(v))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())?;
+
+        if let Some(record) = existing.first() {
+            // Already clocked in, update clock_out if not set
+            if record.clock_out.is_none() {
+                let query_update = "UPDATE tabAttendance SET clock_out = $clock_out WHERE employee_id = $emp AND date = $date;";
+                db.query(query_update)
+                    .bind(("clock_out", now))
+                    .bind(("emp", employee_id.clone()))
+                    .bind(("date", date))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        } else {
+            // New clock-in for today
+            let record = AttendanceRecord {
+                employee_id: employee_id.clone(),
+                date,
+                clock_in: now,
+                clock_out: None,
+                status: "Present".to_string(),
+            };
+            let record_val = serde_json::to_value(&record).map_err(|e| e.to_string())?;
+            db.query("CREATE tabAttendance CONTENT $record;")
+                .bind(("record", record_val))
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        // Save biometric log to DB
+        db.query("CREATE tabBiometricLog CONTENT { employee_id: $emp, timestamp: $ts, lat: $lat, lon: $lon, status: 'Success' };")
+            .bind(("emp", employee_id))
+            .bind(("ts", now))
+            .bind(("lat", lat))
+            .bind(("lon", lon))
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(true)
+    } else {
+        // Outside the geofence boundary, log failure
+        db.query("CREATE tabBiometricLog CONTENT { employee_id: $emp, timestamp: $ts, lat: $lat, lon: $lon, status: 'Failed Geofence' };")
+            .bind(("emp", employee_id))
+            .bind(("ts", now))
+            .bind(("lat", lat))
+            .bind(("lon", lon))
+            .await
+            .map_err(|e| e.to_string())?;
+
+        Ok(false)
+    }
+}

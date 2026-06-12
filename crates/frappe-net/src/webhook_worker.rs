@@ -5,7 +5,7 @@ use surrealdb::engine::any::Any;
 
 #[derive(serde::Deserialize, serde::Serialize, Debug)]
 pub struct WebhookQueueItem {
-    pub id: surrealdb::sql::Thing,
+    pub id: serde_json::Value,
     pub url: String,
     pub payload: String,
     pub status: String, // "Pending", "Completed", "Failed"
@@ -30,7 +30,10 @@ impl WebhookWorker {
                 }
             };
 
-            let items: Vec<WebhookQueueItem> = res.take(0).unwrap_or_default();
+            let items_vals: Vec<serde_json::Value> = res.take(0).unwrap_or_default();
+            let items: Vec<WebhookQueueItem> = items_vals.into_iter()
+                .map(|v| serde_json::from_value(v).unwrap())
+                .collect();
 
             for mut item in items {
                 log::info!("Processing webhook to: {}", item.url);
