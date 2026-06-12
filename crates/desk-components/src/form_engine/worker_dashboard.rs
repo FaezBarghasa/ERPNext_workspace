@@ -314,8 +314,8 @@ pub fn WorkerDashboard(props: WorkerDashboardProps) -> Element {
                         div { class: "h-32 w-full bg-slate-950 rounded-2xl border border-slate-800/80 flex items-center justify-center p-3 relative overflow-hidden",
                             svg {
                                 class: "w-full h-full text-blue-500",
-                                viewBox: "0 0 100 30",
-                                preserveAspectRatio: "none",
+                                view_box: "0 0 100 30",
+                                preserve_aspect_ratio: "none",
                                 path {
                                     d: format!(
                                         "M 0 15 Q 25 {}, 50 15 T 100 {}", 

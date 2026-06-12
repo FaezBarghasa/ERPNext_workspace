@@ -261,7 +261,7 @@ pub fn DynamicForm(props: DynamicFormProps) -> Element {
                             link_options: None,
                             on_change: {
                                 let fieldname = field.fieldname.clone();
-                                let on_change_cb = props.on_change.clone();
+                                let on_change_cb = props.on_change;
                                 move |new_val: Value| {
                                     document_state.write().insert(fieldname.clone(), new_val);
                                     if let Some(ref cb) = on_change_cb {
@@ -407,7 +407,7 @@ fn FieldWidget(props: FieldWidgetProps) -> Element {
                 disabled: field.read_only,
                 oninput: move |e| {
                     let v = e.value().parse::<f64>().ok()
-                        .and_then(|f| serde_json::Number::from_f64(f))
+                        .and_then(serde_json::Number::from_f64)
                         .map(Value::Number)
                         .unwrap_or(Value::Null);
                     props.on_change.call(v);
@@ -419,7 +419,7 @@ fn FieldWidget(props: FieldWidgetProps) -> Element {
             CurrencyFieldWidget {
                 field: field.clone(),
                 value: props.value.clone(),
-                on_change: props.on_change.clone(),
+                on_change: props.on_change,
             }
         },
 
@@ -436,7 +436,7 @@ fn FieldWidget(props: FieldWidgetProps) -> Element {
                     field: field.clone(),
                     value: props.value.clone(),
                     options,
-                    on_change: props.on_change.clone(),
+                    on_change: props.on_change,
                 }
             }
         },
