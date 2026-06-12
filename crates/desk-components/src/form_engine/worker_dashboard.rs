@@ -1,4 +1,6 @@
 use dioxus::prelude::*;
+use erp_cms::video_player::{parse_video_url, generate_embed_html, EmbedOptions, VideoPlatform};
+use erp_cms::security::{generate_private_embed_html, generate_signed_url};
 
 #[derive(Props, Clone, PartialEq)]
 pub struct WorkerDashboardProps {
@@ -23,6 +25,7 @@ pub fn WorkerDashboard(props: WorkerDashboardProps) -> Element {
     // CMS Video Embed Tester
     let mut video_input_url = use_signal(|| "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string());
     let mut embed_html = use_signal(|| "".to_string());
+    let mut range_request_status = use_signal(|| None::<String>);
 
     let handle_clock_in_out = move |_| {
         is_loading.set(true);
@@ -60,13 +63,69 @@ pub fn WorkerDashboard(props: WorkerDashboardProps) -> Element {
     let handle_video_embed_request = move |_| {
         spawn(async move {
             let url = video_input_url.read().clone();
-            // Call simulated embedding generator from CMS
-            if url.contains("youtube.com") || url.contains("youtu.be") {
-                embed_html.set(
-                    r#"<div class="video-container" style="position:relative;padding-bottom:56.25%;height:0;overflow:hidden;"><iframe src="https://www.youtube.com/embed/dQw4w9WgXcQ" frameborder="0" allowfullscreen style="position:absolute;top:0;left:0;width:100%;height:100%;"></iframe></div>"#.to_string()
-                );
-            } else {
-                embed_html.set("<p class='text-red-400'>Unsupported or unparsed media URL</p>".to_string());
+            range_request_status.set(None);
+
+            match parse_video_url(&url) {
+                Ok(info) => {
+                    let options = EmbedOptions {
+                        autoplay: false,
+                        controls: true,
+                        loop_video: false,
+                        muted: false,
+                        poster_url: None,
+                    };
+
+                    if info.platform == VideoPlatform::Html5 || info.platform == VideoPlatform::S3Custom {
+                        let secret = b"secure_dashboard_secret_key_12345";
+                        let file_hash = "worker_training_video_hash_987";
+                        let expires_in_secs = 3600;
+
+                        // Generate the signed URL to validate Range request headers
+                        let signed_url = generate_signed_url(
+                            &info.original_url,
+                            file_hash,
+                            secret,
+                            expires_in_secs,
+                        );
+
+                        range_request_status.set(Some("Verifying range-request support...".to_string()));
+                        
+                        let client = reqwest::Client::new();
+                        let check_res = client.get(&signed_url)
+                            .header("Range", "bytes=0-1023")
+                            .send()
+                            .await;
+
+                        match check_res {
+                            Ok(resp) => {
+                                if resp.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                                    range_request_status.set(Some("Range playback validated (HTTP 206 Partial Content verified)".to_string()));
+                                } else {
+                                    range_request_status.set(Some(format!("Range check failed: Server responded with HTTP {}", resp.status())));
+                                }
+                            }
+                            Err(e) => {
+                                range_request_status.set(Some(format!("Range check unreachable: {}", e)));
+                            }
+                        }
+
+                        let html = generate_private_embed_html(
+                            &info.original_url,
+                            file_hash,
+                            secret,
+                            expires_in_secs,
+                            &options,
+                        );
+                        embed_html.set(html);
+                    } else {
+                        range_request_status.set(Some("Validated static platform playback (YouTube/Vimeo)".to_string()));
+                        let html = generate_embed_html(&info, &options);
+                        embed_html.set(html);
+                    }
+                }
+                Err(_) => {
+                    embed_html.set("<p class='text-red-400'>Unsupported or unparsed media URL</p>".to_string());
+                }
             }
         });
     };
@@ -190,6 +249,19 @@ pub fn WorkerDashboard(props: WorkerDashboardProps) -> Element {
                                 class: "bg-blue-600 hover:bg-blue-500 text-sm font-bold py-3 px-6 rounded-xl transition active:scale-95 whitespace-nowrap",
                                 onclick: handle_video_embed_request,
                                 "Load Embed"
+                            }
+                        }
+
+                        // Range Request Support Status
+                        if let Some(ref status) = *range_request_status.read() {
+                            div { 
+                                class: format!(
+                                    "p-3.5 rounded-2xl text-xs font-semibold border {}",
+                                    if status.contains("verified") || status.contains("validated") { "bg-green-500/10 text-green-400 border-green-500/20" }
+                                    else if status.contains("failed") { "bg-red-500/10 text-red-400 border-red-500/20" }
+                                    else { "bg-slate-500/10 text-slate-400 border-slate-500/20" }
+                                ),
+                                "{status}"
                             }
                         }
 
