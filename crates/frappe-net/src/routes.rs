@@ -452,6 +452,7 @@ pub async fn stream_video(
     path: web::Path<String>,
     req: actix_web::HttpRequest,
     tenant: web::ReqData<TenantContext>,
+    state: web::Data<AppState>,
 ) -> impl Responder {
     let hash = path.into_inner();
     
@@ -459,6 +460,40 @@ pub async fn stream_video(
     let secret = b"my_secret_key";
     if let Err(e) = erp_cms::security::validate_signed_url(&request_uri, secret) {
         return HttpResponse::Forbidden().body(format!("Access Denied: {}", e));
+    }
+
+    // IP validation rule: limit to 5 unique IPs at a time per account/token
+    let client_ip = req.peer_addr()
+        .map(|addr| addr.ip().to_string())
+        .unwrap_or_else(|| "127.0.0.1".to_string());
+
+    let mut account_id = String::new();
+    let query_string = req.query_string();
+    for pair in query_string.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+            if k == "account_id" {
+                account_id = v.to_string();
+                break;
+            } else if k == "_token" && account_id.is_empty() {
+                account_id = v.to_string();
+            }
+        }
+    }
+
+    if account_id.is_empty() {
+        if let Some(hdr) = req.headers().get("X-Account-ID").and_then(|h| h.to_str().ok()) {
+            account_id = hdr.to_string();
+        }
+    }
+
+    if !account_id.is_empty() {
+        let mut ips_map = state.token_ips.lock().unwrap();
+        let ips = ips_map.entry(account_id).or_insert_with(std::collections::HashSet::new);
+        ips.insert(client_ip);
+        if ips.len() > 5 {
+            return HttpResponse::Forbidden().body("Access Denied: Too many IP addresses (limit is 5)");
+        }
     }
     
     let tenant_id = tenant.database.clone();

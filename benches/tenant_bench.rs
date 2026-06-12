@@ -7,7 +7,12 @@ use std::time::Instant;
 #[actix_web::test]
 async fn test_tenant_routing_benchmark() {
     let db = connect("mem://").await.expect("Failed to connect");
-    let app_state = web::Data::new(AppState { db: db.clone() });
+    let (tx, _) = tokio::sync::broadcast::channel(100);
+    let app_state = web::Data::new(AppState {
+        db: db.clone(),
+        broadcaster: tx,
+        token_ips: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
 
     db.use_ns("frappe_cloud").use_db("tenant1").await.unwrap();
     db.query("CREATE Customer CONTENT { name: 'Tenant1Customer' };").await.unwrap();

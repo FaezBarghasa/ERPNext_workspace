@@ -18,7 +18,11 @@ async fn main() -> std::io::Result<()> {
     // Create shared SSE broadcast channel
     let (broadcaster, _) = tokio::sync::broadcast::channel(100);
     
-    let app_state = web::Data::new(AppState { db: db.clone(), broadcaster });
+    let app_state = web::Data::new(AppState {
+        db: db.clone(),
+        broadcaster,
+        token_ips: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
 
     // Start Webhook background worker
     let db_for_worker = db.clone();

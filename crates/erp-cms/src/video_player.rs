@@ -1,5 +1,11 @@
 use serde::{Deserialize, Serialize};
 use regex::Regex;
+use futures_util::StreamExt;
+use sha2::{Digest, Sha256};
+use hmac::{Hmac, Mac};
+use std::io::Write;
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum VideoPlatform {
@@ -35,9 +41,6 @@ pub fn parse_video_url(url: &str) -> Result<VideoInfo, VideoError> {
     let url_trimmed = url.trim();
 
     // YouTube regex patterns
-    // 1. youtube.com/watch?v=ID
-    // 2. youtu.be/ID
-    // 3. youtube.com/embed/ID
     let yt_reg = Regex::new(r#"(?:youtube\.com/(?:[^/]+/.+/|(?:v|e(?:mbed)?)/|.*[?&]v=)|youtu\.be/)([^"&?/\s]{11})"#).unwrap();
     if let Some(caps) = yt_reg.captures(url_trimmed) {
         if let Some(id) = caps.get(1) {
@@ -50,8 +53,6 @@ pub fn parse_video_url(url: &str) -> Result<VideoInfo, VideoError> {
     }
 
     // Vimeo regex patterns
-    // 1. vimeo.com/ID
-    // 2. player.vimeo.com/video/ID
     let vimeo_reg = Regex::new(r#"vimeo\.com/(?:video/)?([0-9]+)"#).unwrap();
     if let Some(caps) = vimeo_reg.captures(url_trimmed) {
         if let Some(id) = caps.get(1) {
@@ -91,7 +92,6 @@ pub fn generate_embed_html(info: &VideoInfo, options: &EmbedOptions) -> String {
         VideoPlatform::YouTube => {
             if options.autoplay {
                 params.push("autoplay=1".to_string());
-                // YouTube requires muting to autoplay
                 params.push("mute=1".to_string());
             }
             if !options.controls {
@@ -166,6 +166,270 @@ pub fn generate_embed_html(info: &VideoInfo, options: &EmbedOptions) -> String {
     }
 }
 
+// ── SVoD Ingestion, Transcoding, Vector Search, and DRM Range Responders ──────
+
+/// Intercepts incoming byte stream from Multipart to support chunked multi-gigabyte uploads
+/// with a maximum 8MB buffer size limit on RAM accumulation. Writes to hash-addressed output file.
+pub async fn handle_multipart_upload(
+    mut payload: actix_multipart::Multipart,
+    target_dir: &str,
+) -> Result<String, actix_web::Error> {
+    let mut file_hash = String::new();
+    
+    while let Some(item) = payload.next().await {
+        let mut field = item?;
+        let content_disposition = field.content_disposition();
+        
+        if content_disposition.get_filename().is_some() {
+            let temp_name = format!(
+                "upload_{}.tmp",
+                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+            );
+            let temp_path = std::path::PathBuf::from(target_dir).join(&temp_name);
+            
+            std::fs::create_dir_all(target_dir)?;
+            let mut temp_file = std::fs::File::create(&temp_path)?;
+            
+            let mut sha256 = Sha256::new();
+            
+            // Constrain accumulation RAM buffer to 8MB max
+            let mut ram_buffer = Vec::with_capacity(8 * 1024 * 1024);
+            
+            while let Some(chunk_res) = field.next().await {
+                let chunk = chunk_res?;
+                sha256.update(&chunk);
+                
+                if ram_buffer.len() + chunk.len() > 8 * 1024 * 1024 {
+                    temp_file.write_all(&ram_buffer)?;
+                    ram_buffer.clear();
+                }
+                ram_buffer.extend_from_slice(&chunk);
+            }
+            
+            if !ram_buffer.is_empty() {
+                temp_file.write_all(&ram_buffer)?;
+            }
+            
+            temp_file.sync_all()?;
+            drop(temp_file);
+            
+            let hash_str = format!("{:x}", sha256.finalize());
+            let final_path = std::path::PathBuf::from(target_dir).join(&hash_str);
+            std::fs::rename(&temp_path, &final_path)?;
+            file_hash = hash_str;
+        }
+    }
+    
+    if file_hash.is_empty() {
+        return Err(actix_web::error::ErrorBadRequest("No file parts detected in request"));
+    }
+    
+    Ok(file_hash)
+}
+
+/// Runs non-blocking HLS transcoding with 4-second chunk segments using ffmpeg
+pub async fn run_ffmpeg_transcode(input: &str, output: &str) -> Result<(), std::io::Error> {
+    let status = tokio::process::Command::new("ffmpeg")
+        .args(&[
+            "-i", input,
+            "-profile:v", "main",
+            "-level", "3.0",
+            "-start_number", "0",
+            "-hls_time", "4",
+            "-hls_list_size", "0",
+            "-f", "hls",
+            output
+        ])
+        .status()
+        .await?;
+        
+    if !status.success() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("FFmpeg failed with status code: {:?}", status.code())
+        ));
+    }
+    Ok(())
+}
+
+/// Executes vector similarity search queries in SurrealDB using HNSW indexes
+pub async fn search_transcripts(
+    db: &surrealdb::Surreal<surrealdb::engine::any::Any>,
+    query_embedding: &[f32; 1536],
+    threshold: f32,
+) -> Result<Vec<serde_json::Value>, surrealdb::Error> {
+    let query = "SELECT *, vector::similarity::cosine(embedding, $query_vec) AS similarity \
+                 FROM media_transcripts \
+                 WHERE vector::similarity::cosine(embedding, $query_vec) >= $threshold \
+                 ORDER BY similarity DESC;";
+                 
+    let vec_emb = query_embedding.to_vec();
+    let mut response = db.query(query)
+        .bind(("query_vec", vec_emb))
+        .bind(("threshold", threshold))
+        .await?;
+        
+    let results: Vec<serde_json::Value> = response.take(0)?;
+    Ok(results)
+}
+
+/// Serves byte ranges supporting HTTP 206 Partial Content range requests
+pub async fn serve_video_range(
+    file_path: &std::path::Path,
+    req: &actix_web::HttpRequest,
+) -> Result<actix_web::HttpResponse, actix_web::Error> {
+    if !file_path.exists() {
+        return Ok(actix_web::HttpResponse::NotFound().body("Video not found"));
+    }
+    
+    let file_len = match std::fs::metadata(file_path) {
+        Ok(m) => m.len(),
+        Err(e) => return Err(actix_web::error::ErrorInternalServerError(e)),
+    };
+    
+    let mut start = 0;
+    let mut end = file_len - 1;
+    let mut is_range = false;
+    
+    if let Some(range_header) = req.headers().get("Range").and_then(|r| r.to_str().ok()) {
+        if range_header.starts_with("bytes=") {
+            let range_str = &range_header["bytes=".len()..];
+            let parts: Vec<&str> = range_str.split('-').collect();
+            if !parts.is_empty() {
+                if let Ok(s) = parts[0].parse::<u64>() {
+                    start = s;
+                    is_range = true;
+                }
+                if parts.len() > 1 && !parts[1].is_empty() {
+                    if let Ok(e_val) = parts[1].parse::<u64>() {
+                        end = std::cmp::min(e_val, file_len - 1);
+                        is_range = true;
+                    }
+                }
+            }
+        }
+    }
+    
+    if start > end || start >= file_len {
+        return Ok(actix_web::HttpResponse::RangeNotSatisfiable()
+            .insert_header(("Content-Range", format!("bytes */{}", file_len)))
+            .finish());
+    }
+    
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = match std::fs::File::open(file_path) {
+        Ok(f) => f,
+        Err(e) => return Err(actix_web::error::ErrorInternalServerError(e)),
+    };
+    
+    if let Err(e) = file.seek(SeekFrom::Start(start)) {
+        return Err(actix_web::error::ErrorInternalServerError(e));
+    }
+    
+    let chunk_len = end - start + 1;
+    let mut buffer = vec![0; chunk_len as usize];
+    if let Err(e) = file.read_exact(&mut buffer) {
+        return Err(actix_web::error::ErrorInternalServerError(e));
+    }
+    
+    if is_range {
+        Ok(actix_web::HttpResponse::PartialContent()
+            .insert_header(("Content-Range", format!("bytes {}-{}/{}", start, end, file_len)))
+            .insert_header(("Content-Type", "video/mp4"))
+            .body(buffer))
+    } else {
+        Ok(actix_web::HttpResponse::Ok()
+            .insert_header(("Content-Length", file_len.to_string()))
+            .insert_header(("Content-Type", "video/mp4"))
+            .body(buffer))
+    }
+}
+
+/// Generates signed URL using HMAC-SHA256
+pub fn generate_signed_url(url: &str, secret: &[u8], expiry_secs: u64) -> String {
+    let expires = chrono::Utc::now().timestamp() + expiry_secs as i64;
+    let message = format!("{}:{}", url, expires);
+    
+    let mut mac = HmacSha256::new_from_slice(secret)
+        .expect("HMAC keys can be of any size");
+    mac.update(message.as_bytes());
+    let signature = hex_encode(&mac.finalize().into_bytes());
+    
+    let separator = if url.contains('?') { "&" } else { "?" };
+    format!("{}{}_token={}&_expires={}", url, separator, signature, expires)
+}
+
+/// Verifies signed URL HMAC signature
+pub fn verify_signed_url(url: &str, secret: &[u8]) -> Result<(), &'static str> {
+    let mut token = "";
+    let mut expires_str = "";
+    
+    let pos = url.find('?').unwrap_or(url.len());
+    let base = &url[..pos];
+    let query = if pos < url.len() { &url[pos + 1..] } else { "" };
+    
+    let mut other_params = Vec::new();
+    
+    for pair in query.split('&') {
+        let mut parts = pair.splitn(2, '=');
+        if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+            if k == "_token" {
+                token = v;
+            } else if k == "_expires" {
+                expires_str = v;
+            } else {
+                other_params.push(pair);
+            }
+        }
+    }
+    
+    if token.is_empty() || expires_str.is_empty() {
+        return Err("Missing signature parameters");
+    }
+    
+    let expires = expires_str.parse::<i64>().map_err(|_| "Invalid expiration format")?;
+    let now = chrono::Utc::now().timestamp();
+    if now > expires {
+        return Err("Signature has expired");
+    }
+    
+    let reconstructed_url = if other_params.is_empty() {
+        base.to_string()
+    } else {
+        format!("{}?{}", base, other_params.join("&"))
+    };
+    
+    let message = format!("{}:{}", reconstructed_url, expires);
+    
+    let mut mac = HmacSha256::new_from_slice(secret)
+        .map_err(|_| "HMAC initialization failed")?;
+    mac.update(message.as_bytes());
+    
+    let token_bytes = hex_decode(token).map_err(|_| "Invalid hex token format")?;
+    if mac.verify_slice(&token_bytes).is_err() {
+        return Err("Invalid signature");
+    }
+    
+    Ok(())
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+fn hex_decode(hex_str: &str) -> Result<Vec<u8>, &'static str> {
+    if hex_str.len() % 2 != 0 {
+        return Err("Hex string must have even length");
+    }
+    let mut bytes = Vec::with_capacity(hex_str.len() / 2);
+    for i in (0..hex_str.len()).step_by(2) {
+        let chunk = &hex_str[i..i+2];
+        let byte = u8::from_str_radix(chunk, 16).map_err(|_| "Invalid hex byte")?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -196,5 +460,16 @@ mod tests {
         let info = parse_video_url(url).unwrap();
         assert_eq!(info.platform, VideoPlatform::Html5);
         assert_eq!(info.video_id, url);
+    }
+
+    #[test]
+    fn test_custom_signed_url() {
+        let url = "http://localhost/video/sample.mp4";
+        let secret = b"supersecret";
+        let signed = generate_signed_url(url, secret, 3600);
+        assert!(verify_signed_url(&signed, secret).is_ok());
+        
+        let invalid_secret = b"wrongsecret";
+        assert!(verify_signed_url(&signed, invalid_secret).is_err());
     }
 }

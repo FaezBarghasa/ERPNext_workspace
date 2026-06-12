@@ -16,3 +16,8 @@ chrono = { version = "0.4", features = ["serde"] }
 tokio = { version = "1.40", features = ["full"] }
 tempfile = "3.27.0"
 log = "0.4"
+actix-web = "4.9"
+actix-multipart = "0.6"
+surrealdb = { version = "3.0.5", default-features = false, features = ["kv-mem"] }
+percent-encoding = "2.3"
+futures-util = "0.3"

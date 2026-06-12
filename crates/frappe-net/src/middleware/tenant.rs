@@ -19,6 +19,8 @@ pub struct AppState {
     pub db: Surreal<Any>,
     /// The broadcaster sender for SSE.
     pub broadcaster: tokio::sync::broadcast::Sender<String>,
+    /// SVoD Advanced IP tracking: account/token -> unique client IP addresses
+    pub token_ips: std::sync::Mutex<std::collections::HashMap<String, std::collections::HashSet<String>>>,
 }
 
 /// TenantContext holds details of the current tenant database configuration.

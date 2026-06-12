@@ -7,7 +7,11 @@ use surrealdb::engine::any::connect;
 async fn test_tenant_isolation() {
     let db = connect("mem://").await.expect("Failed to connect to SurrealDB");
     let (tx, _) = tokio::sync::broadcast::channel(100);
-    let app_state = web::Data::new(AppState { db: db.clone(), broadcaster: tx });
+    let app_state = web::Data::new(AppState {
+        db: db.clone(),
+        broadcaster: tx,
+        token_ips: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
 
     // Setup mock databases
     db.use_ns("frappe_cloud").use_db("tenant1").await.unwrap();

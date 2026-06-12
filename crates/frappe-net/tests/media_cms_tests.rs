@@ -8,7 +8,11 @@ use erp_cms::security::{generate_signed_url, generate_private_embed_html};
 async fn test_media_cms_upload_and_stream() {
     let db = connect("mem://").await.expect("Failed to connect to SurrealDB");
     let (tx, _) = tokio::sync::broadcast::channel(100);
-    let app_state = web::Data::new(AppState { db: db.clone(), broadcaster: tx });
+    let app_state = web::Data::new(AppState {
+        db: db.clone(),
+        broadcaster: tx,
+        token_ips: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
 
     let app = test::init_service(
         App::new()
@@ -183,4 +187,61 @@ async fn test_media_cms_upload_and_stream() {
 
     // Clean up temporary storage directory
     let _ = std::fs::remove_dir_all("./data/storage/tenant1");
+}
+
+#[actix_web::test]
+async fn test_svod_ip_limit_rule() {
+    let db = connect("mem://").await.expect("Failed to connect to SurrealDB");
+    let (tx, _) = tokio::sync::broadcast::channel(100);
+    let app_state = web::Data::new(AppState {
+        db: db.clone(),
+        broadcaster: tx,
+        token_ips: std::sync::Mutex::new(std::collections::HashMap::new()),
+    });
+
+    let app = test::init_service(
+        App::new()
+            .app_data(app_state.clone())
+            .wrap(TenantResolver)
+            .configure(routes::config)
+    ).await;
+
+    // Create dummy video file
+    let file_hash = "ip_test_video_123";
+    let file_dir = std::path::PathBuf::from("./data/storage/tenant_ip");
+    std::fs::create_dir_all(&file_dir).unwrap();
+    std::fs::write(file_dir.join(file_hash), b"dummy video content").unwrap();
+
+    let secret = b"my_secret_key";
+    let base_url = format!("/api/cms/video/stream/{}", file_hash);
+    let signed_url = generate_signed_url(&base_url, file_hash, secret, 3600);
+
+    // Call stream endpoint from 5 different IPs (should all succeed)
+    for i in 1..=5 {
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, i));
+        let addr = std::net::SocketAddr::new(ip, 8080);
+        let req = test::TestRequest::get()
+            .uri(&signed_url)
+            .insert_header(("Host", "tenant_ip.localhost"))
+            .peer_addr(addr)
+            .to_request();
+        let resp = test::call_service(&app, req).await;
+        assert!(resp.status().is_success());
+    }
+
+    // Call stream endpoint from the 6th IP (should be denied 403)
+    let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 168, 1, 6));
+    let addr = std::net::SocketAddr::new(ip, 8080);
+    let req = test::TestRequest::get()
+        .uri(&signed_url)
+        .insert_header(("Host", "tenant_ip.localhost"))
+        .peer_addr(addr)
+        .to_request();
+    let resp = test::call_service(&app, req).await;
+    assert_eq!(resp.status(), actix_web::http::StatusCode::FORBIDDEN);
+    let body = test::read_body(resp).await;
+    assert!(std::str::from_utf8(&body).unwrap().contains("Too many IP addresses"));
+
+    // Clean up temporary storage
+    let _ = std::fs::remove_dir_all("./data/storage/tenant_ip");
 }
