@@ -524,7 +524,7 @@ async fn load_site_config(bench_root: &Path, site: &str) -> Result<SiteConfig> {
 }
 
 /// Discovers migration files from the apps directory.
-fn discover_migrations(bench_root: &Path, _app: Option<&str>) -> Vec<String> {
+fn discover_migrations(_bench_root: &Path, _app: Option<&str>) -> Vec<String> {
     // In a full implementation this would walk app/migrations/*.surql files
     // and compare against a migrations table in SurrealDB.
     // For now returns a representative set of known core migrations.
@@ -545,7 +545,6 @@ async fn apply_migration(db_url: &str, _site: &str, migration_name: &str) -> Res
 }
 
 async fn init_core_schema(db_url: &str, site_name: &str) -> Result<()> {
-    use surrealdb::Surreal;
     use surrealdb::engine::any;
 
     let db = any::connect(db_url)
@@ -580,7 +579,7 @@ async fn init_core_schema(db_url: &str, site_name: &str) -> Result<()> {
     ];
 
     for stmt in &schema_ddl {
-        db.query(stmt)
+        db.query(*stmt)
             .await
             .with_context(|| format!("Failed to execute DDL: {}", stmt))?;
     }
@@ -589,7 +588,6 @@ async fn init_core_schema(db_url: &str, site_name: &str) -> Result<()> {
 }
 
 async fn export_database(db_url: &str, site_name: &str, output_path: &Path) -> Result<()> {
-    use surrealdb::Surreal;
     use surrealdb::engine::any;
 
     let db = any::connect(db_url)

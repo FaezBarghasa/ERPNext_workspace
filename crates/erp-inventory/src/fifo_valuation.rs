@@ -1,244 +1,252 @@
-use rust_decimal::Decimal;
-use rust_decimal_macros::dec;
+use rust_decimal::{Decimal, RoundingStrategy};
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
+use surrealdb::types::RecordId;
 use chrono::{DateTime, Utc};
 
-/// A single batch of stock received at a specific rate.
-/// These are stored ordered by creation time to form the FIFO queue.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StockBatch {
-    pub item_code: String,
-    pub warehouse: String,
+/// ValuationError represents issues occurring during FIFO inventory calculation and database updates.
+#[derive(Debug, thiserror::Error)]
+pub enum ValuationError {
+    /// The requested quantity for dispatch exceeds current physical warehouse stock.
+    #[error("Insufficient stock. Requested: {requested}, Available: {available}")]
+    InsufficientStock {
+        /// The quantity requested.
+        requested: Decimal,
+        /// The current stock level.
+        available: Decimal,
+    },
+    /// A general database error.
+    #[error("Database error: {0}")]
+    Database(String),
+}
+
+/// A single stock item layer in the FIFO queue.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct StockStackItem {
+    /// The optional database RecordId of the corresponding batch record.
+    pub id: Option<RecordId>,
+    /// Available quantity.
     pub qty: Decimal,
-    pub incoming_rate: Decimal,
-    pub received_at: DateTime<Utc>,
-    pub voucher_no: String,
-}
-
-/// Result of consuming stock via FIFO layers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FifoConsumeResult {
-    pub consumed_qty: Decimal,
-    pub weighted_avg_rate: Decimal,
-    pub total_value: Decimal,
-    /// Individual batch layers consumed (for audit trail)
-    pub layers: Vec<ConsumedLayer>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ConsumedLayer {
-    pub batch_voucher_no: String,
-    pub qty_consumed: Decimal,
+    /// Incoming valuation rate.
     pub rate: Decimal,
-    pub value: Decimal,
+    /// Exact receipt timestamp.
+    pub entry_time: DateTime<Utc>,
 }
 
-/// A stock ledger entry used for both inbound (positive qty) and outbound (negative qty) movements.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StockLedgerEntry {
-    pub item_code: String,
-    pub warehouse: String,
-    /// Positive = receipt, Negative = issue/consumption
-    pub qty: Decimal,
-    /// For receipts: the actual purchase rate.
-    /// For issues: computed by the FIFO engine from existing batches.
-    pub valuation_rate: Decimal,
-    pub voucher_type: String,
-    pub voucher_no: String,
-    pub posting_date: DateTime<Utc>,
+/// Consumes quantity from the stock stack oldest-first, returning the total cost of goods sold.
+pub fn consume_fifo(
+    stack: &mut Vec<StockStackItem>,
+    mut dispatch_qty: Decimal,
+) -> Result<Decimal, ValuationError> {
+    let total_available: Decimal = stack.iter().map(|item| item.qty).sum();
+    if dispatch_qty > total_available {
+        return Err(ValuationError::InsufficientStock {
+            requested: dispatch_qty,
+            available: total_available,
+        });
+    }
+
+    let mut total_cost = Decimal::ZERO;
+    stack.sort_by_key(|item| item.entry_time);
+
+    while dispatch_qty > Decimal::ZERO && !stack.is_empty() {
+        let mut item = stack.remove(0);
+        let consumed = dispatch_qty.min(item.qty);
+        let item_cost = consumed * item.rate;
+        total_cost += item_cost;
+        dispatch_qty -= consumed;
+        item.qty -= consumed;
+
+        if item.qty > Decimal::ZERO {
+            stack.insert(0, item);
+        }
+    }
+
+    Ok(total_cost.round_dp_with_strategy(6, RoundingStrategy::MidpointAwayFromZero))
 }
 
+/// Valuation and ledger processing engine.
 pub struct FifoValuationEngine;
 
 impl FifoValuationEngine {
-    /// Processes an inbound stock receipt: creates a new FIFO batch and persists
-    /// the stock ledger entry.
-    pub async fn receive_stock(
-        db: &Surreal<Any>,
-        entry: &StockLedgerEntry,
-    ) -> Result<(), String> {
-        if entry.qty <= Decimal::ZERO {
-            return Err("Receipt qty must be positive".to_string());
-        }
-
-        let batch = StockBatch {
-            item_code: entry.item_code.clone(),
-            warehouse: entry.warehouse.clone(),
-            qty: entry.qty,
-            incoming_rate: entry.valuation_rate,
-            received_at: entry.posting_date,
-            voucher_no: entry.voucher_no.clone(),
-        };
-
-        // Persist the FIFO batch layer
-        db.query(
-            "CREATE tabStockBatch CONTENT { \
-                item_code: $item_code, \
-                warehouse: $warehouse, \
-                qty: $qty, \
-                incoming_rate: $incoming_rate, \
-                received_at: $received_at, \
-                voucher_no: $voucher_no \
-            };",
-        )
-        .bind(("item_code", batch.item_code.clone()))
-        .bind(("warehouse", batch.warehouse.clone()))
-        .bind(("qty", batch.qty.to_string()))
-        .bind(("incoming_rate", batch.incoming_rate.to_string()))
-        .bind(("received_at", batch.received_at.to_rfc3339()))
-        .bind(("voucher_no", batch.voucher_no.clone()))
-        .await
-        .map_err(|e| e.to_string())?;
-
-        // Persist the stock ledger entry
-        Self::insert_sle(db, entry, entry.valuation_rate).await
-    }
-
-    /// Processes a stock issue using FIFO: consumes the oldest batches first,
-    /// calculates the weighted-average consumption rate, and updates batch quantities.
-    pub async fn issue_stock(
-        db: &Surreal<Any>,
-        entry: &StockLedgerEntry,
-    ) -> Result<FifoConsumeResult, String> {
-        if entry.qty >= Decimal::ZERO {
-            return Err("Issue qty must be negative".to_string());
-        }
-
-        let qty_to_consume = entry.qty.abs();
-
-        // Fetch existing FIFO batches for this item+warehouse ordered oldest-first
-        let mut res = db
-            .query(
-                "SELECT * FROM tabStockBatch \
-                 WHERE item_code = $item_code AND warehouse = $warehouse AND qty > 0 \
-                 ORDER BY received_at ASC;",
-            )
-            .bind(("item_code", entry.item_code.clone()))
-            .bind(("warehouse", entry.warehouse.clone()))
-            .await
-            .map_err(|e| e.to_string())?;
-
-        let batch_rows: Vec<serde_json::Value> = res.take(0).unwrap_or_default();
-
-        let mut remaining = qty_to_consume;
-        let mut total_value = Decimal::ZERO;
-        let mut layers: Vec<ConsumedLayer> = Vec::new();
-
-        for row in &batch_rows {
-            if remaining <= Decimal::ZERO {
-                break;
-            }
-
-            let batch_id = row["id"].as_str().unwrap_or("").to_string();
-            let batch_qty: Decimal = row["qty"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::ZERO);
-            let batch_rate: Decimal = row["incoming_rate"]
-                .as_str()
-                .and_then(|s| s.parse().ok())
-                .unwrap_or(Decimal::ZERO);
-            let batch_voucher = row["voucher_no"].as_str().unwrap_or("").to_string();
-
-            let consumed = remaining.min(batch_qty);
-            let value = consumed * batch_rate;
-            total_value += value;
-            remaining -= consumed;
-
-            layers.push(ConsumedLayer {
-                batch_voucher_no: batch_voucher,
-                qty_consumed: consumed,
-                rate: batch_rate,
-                value,
-            });
-
-            // Update batch remaining quantity in DB
-            let new_batch_qty = batch_qty - consumed;
-            db.query("UPDATE $id SET qty = $new_qty;")
-                .bind(("id", batch_id))
-                .bind(("new_qty", new_batch_qty.to_string()))
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-
-        if remaining > Decimal::ZERO {
-            return Err(format!(
-                "Insufficient stock for {} in {}. Short by {}",
-                entry.item_code, entry.warehouse, remaining
-            ));
-        }
-
-        let weighted_avg_rate = if qty_to_consume > Decimal::ZERO {
-            total_value / qty_to_consume
-        } else {
-            Decimal::ZERO
-        };
-
-        // Persist the outgoing SLE with the FIFO-computed valuation rate
-        Self::insert_sle(db, entry, weighted_avg_rate).await?;
-
-        Ok(FifoConsumeResult {
-            consumed_qty: qty_to_consume,
-            weighted_avg_rate,
-            total_value,
-            layers,
-        })
-    }
-
-    /// Returns the current in-stock quantity for an item+warehouse pair.
-    pub async fn current_qty(
+    /// Processes stock issues, calculates total COGS, and updates database records inside a transaction.
+    pub async fn process_stock_issue(
         db: &Surreal<Any>,
         item_code: &str,
         warehouse: &str,
-    ) -> Result<Decimal, String> {
+        dispatch_qty: Decimal,
+        voucher_no: &str,
+        posting_date: DateTime<Utc>,
+    ) -> Result<Decimal, ValuationError> {
         let mut res = db
-            .query(
-                "SELECT math::sum(qty) AS total_qty FROM tabStockBatch \
-                 WHERE item_code = $item_code AND warehouse = $warehouse;",
-            )
+            .query("SELECT * FROM tabStockBatch WHERE item_code = $item_code AND warehouse = $warehouse AND qty > 0 ORDER BY received_at ASC;")
             .bind(("item_code", item_code.to_string()))
             .bind(("warehouse", warehouse.to_string()))
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| ValuationError::Database(e.to_string()))?;
+        
+        let batch_vals: Vec<serde_json::Value> = res.take(0).unwrap_or_default();
+        println!("BATCH_VALS FOR {} IN {}: {:?}", item_code, warehouse, batch_vals);
+        
+        let mut stack = Vec::new();
+        for val in batch_vals {
+            let id_val = val["id"].clone();
+            let id: RecordId = if let Some(s) = id_val.as_str() {
+                let parts: Vec<&str> = s.split(':').collect();
+                if parts.len() == 2 {
+                    RecordId::new(parts[0], parts[1])
+                } else {
+                    return Err(ValuationError::Database("Invalid RecordId string format".to_string()));
+                }
+            } else {
+                serde_json::from_value(id_val)
+                    .map_err(|e| ValuationError::Database(e.to_string()))?
+            };
+            let qty: Decimal = if let Some(n) = val["qty"].as_f64() {
+                Decimal::from_f64_retain(n).unwrap_or(Decimal::ZERO)
+            } else if let Some(s) = val["qty"].as_str() {
+                s.parse().unwrap_or(Decimal::ZERO)
+            } else {
+                Decimal::ZERO
+            };
+            let rate: Decimal = if let Some(n) = val["incoming_rate"].as_f64() {
+                Decimal::from_f64_retain(n).unwrap_or(Decimal::ZERO)
+            } else if let Some(s) = val["incoming_rate"].as_str() {
+                s.parse().unwrap_or(Decimal::ZERO)
+            } else {
+                Decimal::ZERO
+            };
+            let entry_time: DateTime<Utc> = serde_json::from_value(val["received_at"].clone())
+                .map_err(|e| ValuationError::Database(e.to_string()))?;
+            
+            stack.push(StockStackItem {
+                id: Some(id),
+                qty,
+                rate,
+                entry_time,
+            });
+        }
 
-        let row: Option<serde_json::Value> = res.take(0).unwrap_or(None);
-        let qty_str = row
-            .and_then(|v| v["total_qty"].as_str().map(|s| s.to_string()))
-            .unwrap_or_else(|| "0".to_string());
+        let mut stack_clone = stack.clone();
+        let total_cost = consume_fifo(&mut stack_clone, dispatch_qty)?;
 
-        qty_str
-            .parse::<Decimal>()
-            .map_err(|e| format!("Failed to parse qty: {}", e))
+        let mut query_parts = Vec::new();
+        query_parts.push("BEGIN TRANSACTION;".to_string());
+
+        for original in &stack {
+            let id = original.id.as_ref().unwrap();
+            let id_str = format!("{}:`{}`", id.table, match &id.key {
+                surrealdb::types::RecordIdKey::String(s) => s.clone(),
+                surrealdb::types::RecordIdKey::Number(n) => n.to_string(),
+                _ => format!("{:?}", id.key),
+            });
+
+            if let Some(remaining) = stack_clone.iter().find(|item| item.id == original.id) {
+                if remaining.qty != original.qty {
+                    query_parts.push(format!(
+                        "UPDATE {} SET qty = {};",
+                        id_str,
+                        remaining.qty
+                    ));
+                }
+            } else {
+                query_parts.push(format!(
+                    "UPDATE {} SET qty = 0;",
+                    id_str
+                ));
+            }
+        }
+
+        let actual_rate = if dispatch_qty.is_zero() { Decimal::ZERO } else { total_cost / dispatch_qty };
+
+        query_parts.push(format!(
+            "CREATE tabStockLedger CONTENT {{ \
+                item_code: \"{item_code}\", \
+                warehouse: \"{warehouse}\", \
+                qty: {qty}, \
+                valuation_rate: {val_rate}, \
+                voucher_type: \"Stock Issue\", \
+                voucher_no: \"{voucher_no}\", \
+                posting_date: \"{posting_date}\" \
+            }};",
+            item_code = item_code,
+            warehouse = warehouse,
+            qty = -dispatch_qty,
+            val_rate = actual_rate,
+            voucher_no = voucher_no,
+            posting_date = posting_date.to_rfc3339()
+        ));
+
+        query_parts.push("COMMIT TRANSACTION;".to_string());
+        let full_query = query_parts.join("\n");
+
+        db.query(&full_query)
+            .await
+            .map_err(|e| ValuationError::Database(e.to_string()))?
+            .check()
+            .map_err(|e| ValuationError::Database(e.to_string()))?;
+
+        Ok(total_cost)
     }
 
-    /// Internal helper: inserts a Stock Ledger Entry record.
-    async fn insert_sle(
+    /// Creates a new receipt batch layer and persists a ledger entry.
+    pub async fn process_stock_receipt(
         db: &Surreal<Any>,
-        entry: &StockLedgerEntry,
-        actual_rate: Decimal,
-    ) -> Result<(), String> {
-        db.query(
-            "CREATE tabStockLedger CONTENT { \
-                item_code: $item_code, \
-                warehouse: $warehouse, \
-                qty: $qty, \
-                valuation_rate: $val_rate, \
-                voucher_type: $voucher_type, \
-                voucher_no: $voucher_no, \
-                posting_date: $posting_date \
-            };",
-        )
-        .bind(("item_code", entry.item_code.clone()))
-        .bind(("warehouse", entry.warehouse.clone()))
-        .bind(("qty", entry.qty.to_string()))
-        .bind(("val_rate", actual_rate.to_string()))
-        .bind(("voucher_type", entry.voucher_type.clone()))
-        .bind(("voucher_no", entry.voucher_no.clone()))
-        .bind(("posting_date", entry.posting_date.to_rfc3339()))
-        .await
-        .map_err(|e| e.to_string())?;
+        item_code: &str,
+        warehouse: &str,
+        qty: Decimal,
+        rate: Decimal,
+        voucher_no: &str,
+        posting_date: DateTime<Utc>,
+    ) -> Result<(), ValuationError> {
+        let mut query_parts = Vec::new();
+        query_parts.push("BEGIN TRANSACTION;".to_string());
+
+        query_parts.push(format!(
+            "CREATE tabStockBatch CONTENT {{ \
+                item_code: \"{item_code}\", \
+                warehouse: \"{warehouse}\", \
+                qty: {qty}, \
+                incoming_rate: {rate}, \
+                received_at: \"{posting_date}\", \
+                voucher_no: \"{voucher_no}\" \
+            }};",
+            item_code = item_code,
+            warehouse = warehouse,
+            qty = qty,
+            rate = rate,
+            posting_date = posting_date.to_rfc3339(),
+            voucher_no = voucher_no
+        ));
+
+        query_parts.push(format!(
+            "CREATE tabStockLedger CONTENT {{ \
+                item_code: \"{item_code}\", \
+                warehouse: \"{warehouse}\", \
+                qty: {qty}, \
+                valuation_rate: {rate}, \
+                voucher_type: \"Stock Receipt\", \
+                voucher_no: \"{voucher_no}\", \
+                posting_date: \"{posting_date}\" \
+            }};",
+            item_code = item_code,
+            warehouse = warehouse,
+            qty = qty,
+            rate = rate,
+            voucher_no = voucher_no,
+            posting_date = posting_date.to_rfc3339()
+        ));
+
+        query_parts.push("COMMIT TRANSACTION;".to_string());
+        let full_query = query_parts.join("\n");
+
+        db.query(&full_query)
+            .await
+            .map_err(|e| ValuationError::Database(e.to_string()))?
+            .check()
+            .map_err(|e| ValuationError::Database(e.to_string()))?;
+
         Ok(())
     }
 }
@@ -247,25 +255,77 @@ impl FifoValuationEngine {
 mod tests {
     use super::*;
     use rust_decimal_macros::dec;
+    use surrealdb::engine::any::connect;
 
     #[test]
-    fn fifo_weighted_average_calculation() {
-        // Batch 1: 10 units @ 100 = value 1000
-        // Batch 2: 5 units @ 120 = value 600
-        // Issue 12 units → consume all of batch 1 + 2 from batch 2
-        // weighted avg = (10*100 + 2*120) / 12 = (1000 + 240) / 12 = 103.33...
-        let total_value = dec!(10) * dec!(100) + dec!(2) * dec!(120);
-        let qty = dec!(12);
-        let weighted_avg = total_value / qty;
-        // 1240 / 12 = 103.333...
-        assert_eq!(weighted_avg, dec!(1240) / dec!(12));
+    fn test_consume_fifo_basic() {
+        let mut stack = vec![
+            StockStackItem {
+                id: None,
+                qty: dec!(10.0),
+                rate: dec!(10.0),
+                entry_time: Utc::now() - chrono::Duration::hours(2),
+            },
+            StockStackItem {
+                id: None,
+                qty: dec!(5.0),
+                rate: dec!(12.0),
+                entry_time: Utc::now() - chrono::Duration::hours(1),
+            },
+        ];
+
+        let cost = consume_fifo(&mut stack, dec!(12.0)).unwrap();
+        assert_eq!(cost, dec!(124.0));
+        assert_eq!(stack.len(), 1);
+        assert_eq!(stack[0].qty, dec!(3.0));
     }
 
-    #[test]
-    fn issue_exceeds_stock_should_error() {
-        // Simulate the check: if remaining > 0 after consuming all batches, error
-        let total_available = dec!(5);
-        let requested = dec!(10);
-        assert!(requested > total_available, "Should detect insufficient stock");
+    #[tokio::test]
+    async fn test_fifo_three_batches_dispatch() {
+        let db = connect("mem://").await.unwrap();
+        db.use_ns("test").use_db("test").await.unwrap();
+
+        let item = "ITEM-001";
+        let wh = "Warehouse-A";
+
+        FifoValuationEngine::process_stock_receipt(&db, item, wh, dec!(10.0), dec!(10.0), "REC-01", Utc::now() - chrono::Duration::hours(3))
+            .await
+            .unwrap();
+
+        FifoValuationEngine::process_stock_receipt(&db, item, wh, dec!(20.0), dec!(12.0), "REC-02", Utc::now() - chrono::Duration::hours(2))
+            .await
+            .unwrap();
+
+        FifoValuationEngine::process_stock_receipt(&db, item, wh, dec!(5.0), dec!(15.0), "REC-03", Utc::now() - chrono::Duration::hours(1))
+            .await
+            .unwrap();
+
+        let cogs = FifoValuationEngine::process_stock_issue(&db, item, wh, dec!(22.0), "ISS-01", Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(cogs, dec!(244.0));
+
+        let mut res = db.query("SELECT * FROM tabStockBatch WHERE item_code = $item AND warehouse = $wh AND qty > 0 ORDER BY received_at ASC;")
+            .bind(("item", item.to_string()))
+            .bind(("wh", wh.to_string()))
+            .await
+            .unwrap();
+        let remaining_batches: Vec<serde_json::Value> = res.take(0).unwrap();
+        let mut total_val = dec!(0.0);
+        for val in remaining_batches {
+            let qty: Decimal = if let Some(n) = val["qty"].as_f64() {
+                Decimal::from_f64_retain(n).unwrap()
+            } else {
+                val["qty"].as_str().unwrap().parse().unwrap()
+            };
+            let rate: Decimal = if let Some(n) = val["incoming_rate"].as_f64() {
+                Decimal::from_f64_retain(n).unwrap()
+            } else {
+                val["incoming_rate"].as_str().unwrap().parse().unwrap()
+            };
+            total_val += qty * rate;
+        }
+        assert_eq!(total_val, dec!(171.0));
     }
 }

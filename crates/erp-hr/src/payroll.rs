@@ -6,6 +6,7 @@ use erp_accounting::posting::GLEntry;
 use erp_accounting::LedgerError;
 use surrealdb::types::RecordId;
 use rust_decimal::prelude::{FromPrimitive, ToPrimitive};
+use tokio::task::JoinSet;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SalaryComponent {
@@ -193,6 +194,67 @@ pub fn post_payroll_batch(
     Ok(entries)
 }
 
+/// Run the time-phased concurrent payroll batch calculator over the employee roster.
+pub async fn run_concurrent_payroll_batch(
+    db: &surrealdb::Surreal<surrealdb::engine::any::Any>,
+    employee_ids: Vec<String>,
+    variables_map: HashMap<String, HashMap<String, Decimal>>,
+    structure: SalaryStructure,
+    tax_slabs: Vec<TaxSlab>,
+) -> Result<Vec<SalarySlipResult>, PayrollError> {
+    let mut join_set: JoinSet<Result<SalarySlipResult, PayrollError>> = JoinSet::new();
+
+    for emp_id in employee_ids {
+        let vars = variables_map.get(&emp_id).cloned().unwrap_or_default();
+        let struct_clone = structure.clone();
+        let slabs_clone = tax_slabs.clone();
+
+        join_set.spawn(async move {
+            let slip = compute_salary_slip_dynamic(emp_id, &vars, &struct_clone, &slabs_clone)?;
+            Ok::<SalarySlipResult, PayrollError>(slip)
+        });
+    }
+
+    let mut results = Vec::with_capacity(join_set.len());
+    while let Some(res) = join_set.join_next().await {
+        match res {
+            Ok(inner_res) => {
+                let slip = inner_res?;
+                results.push(slip);
+            }
+            Err(join_err) => {
+                return Err(PayrollError::Evaluation(
+                    "Concurrent task execution failed".to_string(),
+                    join_err.to_string(),
+                ));
+            }
+        }
+    }
+
+    let mut query_parts = Vec::new();
+    query_parts.push("BEGIN TRANSACTION;".to_string());
+
+    for slip in &results {
+        let slip_json = serde_json::to_string(slip)
+            .map_err(|e| PayrollError::Evaluation("Serialization error".to_string(), e.to_string()))?;
+        query_parts.push(format!(
+            "CREATE tabSalarySlip CONTENT {};",
+            slip_json
+        ));
+    }
+
+    query_parts.push("COMMIT TRANSACTION;".to_string());
+    let full_query = query_parts.join("\n");
+
+    db.query(&full_query)
+        .await
+        .map_err(|e| PayrollError::Ledger(LedgerError::Database(e.to_string())))?
+        .check()
+        .map_err(|e| PayrollError::Ledger(LedgerError::Database(e.to_string())))?;
+
+    Ok(results)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +371,32 @@ mod tests {
         assert_eq!(postings[1].credit, dec!(1300));
         // Bank Credit: 4000 + 4700 = 8700
         assert_eq!(postings[2].credit, dec!(8700));
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_payroll_batch() {
+        let db = surrealdb::engine::any::connect("mem://").await.unwrap();
+        db.use_ns("test").use_db("test").await.unwrap();
+
+        let structure = SalaryStructure {
+            base_pay: dec!(5000.00),
+            earnings: vec![
+                SalaryComponent {
+                    name: "HRA".to_string(),
+                    formula: "base * 0.10".to_string(),
+                },
+            ],
+            deductions: vec![],
+        };
+
+        let employee_ids = vec!["EMP-1".to_string(), "EMP-2".to_string()];
+        let mut variables_map = HashMap::new();
+        variables_map.insert("EMP-1".to_string(), HashMap::new());
+        variables_map.insert("EMP-2".to_string(), HashMap::new());
+
+        let slips = run_concurrent_payroll_batch(&db, employee_ids, variables_map, structure, vec![]).await.unwrap();
+        assert_eq!(slips.len(), 2);
+        assert_eq!(slips[0].gross_pay, dec!(5500.00));
+        assert_eq!(slips[1].gross_pay, dec!(5500.00));
     }
 }

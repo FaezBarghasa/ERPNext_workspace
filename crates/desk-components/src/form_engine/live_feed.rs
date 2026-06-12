@@ -252,7 +252,7 @@ fn FeedEventCard(props: FeedEventCardProps) -> Element {
                 if let Some(msg) = &ev.message {
                     div {
                         style: "margin-top:0.3rem; font-size:0.8rem; color:#6c7086; font-style:italic; white-space:pre-wrap;",
-                        ""{msg}""
+                        "{msg}"
                     }
                 }
             }

@@ -5,6 +5,7 @@
 /// Renders upload progress, file preview thumbnails, and the resulting
 /// storage hash URL once the upload completes.
 use dioxus::prelude::*;
+use dioxus::html::HasFileData;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,25 +87,23 @@ pub fn FileUpload(props: FileUploadProps) -> Element {
                     // Dioxus v0.7 drag event file handling
                     spawn(async move {
                         upload_state.set(UploadState::Uploading { progress_pct: 0 });
-                        let files = e.files();
-                        if let Some(file_engine) = files {
-                            let file_names = file_engine.files();
-                            for file_name in file_names {
-                                if let Some(file_bytes) = file_engine.read_file(&file_name).await {
-                                    let result = upload_bytes(
-                                        &api_base,
-                                        &tenant_id,
-                                        &file_name,
-                                        file_bytes,
-                                    ).await;
-                                    match result {
-                                        Ok(uploaded) => {
-                                            props.on_upload.call(uploaded.clone());
-                                            upload_state.set(UploadState::Done(uploaded));
-                                        }
-                                        Err(e) => {
-                                            upload_state.set(UploadState::Failed(e));
-                                        }
+                        let files = e.data().files();
+                        for file in files {
+                            let file_name = file.name();
+                            if let Ok(file_bytes) = file.read_bytes().await {
+                                let result = upload_bytes(
+                                    &api_base,
+                                    &tenant_id,
+                                    &file_name,
+                                    file_bytes.to_vec(),
+                                ).await;
+                                match result {
+                                    Ok(uploaded) => {
+                                        props.on_upload.call(uploaded.clone());
+                                        upload_state.set(UploadState::Done(uploaded));
+                                    }
+                                    Err(e) => {
+                                        upload_state.set(UploadState::Failed(e));
                                     }
                                 }
                             }
@@ -135,16 +134,16 @@ pub fn FileUpload(props: FileUploadProps) -> Element {
                                     let tenant_id = tenant_id.clone();
                                     spawn(async move {
                                         upload_state.set(UploadState::Uploading { progress_pct: 0 });
-                                        if let Some(file_engine) = e.files() {
-                                            for file_name in file_engine.files() {
-                                                if let Some(bytes) = file_engine.read_file(&file_name).await {
-                                                    match upload_bytes(&api_base, &tenant_id, &file_name, bytes).await {
-                                                        Ok(uploaded) => {
-                                                            props.on_upload.call(uploaded.clone());
-                                                            upload_state.set(UploadState::Done(uploaded));
-                                                        }
-                                                        Err(e) => upload_state.set(UploadState::Failed(e)),
+                                        let files = e.files();
+                                        for file in files {
+                                            let file_name = file.name();
+                                            if let Ok(bytes) = file.read_bytes().await {
+                                                match upload_bytes(&api_base, &tenant_id, &file_name, bytes.to_vec()).await {
+                                                    Ok(uploaded) => {
+                                                        props.on_upload.call(uploaded.clone());
+                                                        upload_state.set(UploadState::Done(uploaded));
                                                     }
+                                                    Err(e) => upload_state.set(UploadState::Failed(e)),
                                                 }
                                             }
                                         }

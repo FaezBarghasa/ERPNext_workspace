@@ -2,15 +2,11 @@ use actix_web::{web, App, HttpServer};
 use surrealdb::engine::any::connect;
 use tokio::task;
 
-mod h3_server;
-mod middleware;
-mod routes;
-mod sse;
-mod webhook_worker;
+use frappe_net::middleware::tenant::{AppState, TenantResolver};
+use frappe_net::h3_server::H3Server;
+use frappe_net::webhook_worker::WebhookWorker;
+use frappe_net::routes;
 
-use middleware::tenant::{AppState, TenantResolver};
-use h3_server::H3Server;
-use webhook_worker::WebhookWorker;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {

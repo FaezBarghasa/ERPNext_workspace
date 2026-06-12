@@ -86,7 +86,7 @@ impl PeriodClosingEngine {
             };
 
             closing_entries.push(GLEntry {
-                account: RecordId::from_table_key("tabAccount", account_str.as_str()),
+                account: RecordId::new("tabAccount", account_str.as_str()),
                 debit,
                 credit,
                 voucher_type: "Period Closing Voucher".to_string(),
@@ -105,7 +105,7 @@ impl PeriodClosingEngine {
         };
 
         closing_entries.push(GLEntry {
-            account: RecordId::from_table_key(
+            account: RecordId::new(
                 "tabAccount",
                 retained_earnings_account,
             ),

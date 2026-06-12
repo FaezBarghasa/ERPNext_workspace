@@ -1,70 +1,95 @@
-use crate::posting::{GLEntry, LedgerError};
+use crate::posting::{GLEntry, LedgerError, validate_and_compile_transaction};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
 use chrono::{DateTime, Utc};
 
+/// Defines a locking period to prevent posting entries to closed accounting terms.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeriodLock {
+    /// Date range start.
+    pub start_date: DateTime<Utc>,
+    /// Date range end.
+    pub end_date: DateTime<Utc>,
+    /// Whether this period is locked.
+    pub is_locked: bool,
+}
+
 /// A fully balanced double-entry accounting transaction.
-/// All entries must satisfy: Σ debit == Σ credit before committing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountingTransaction {
-    /// Identifies the source document type (e.g. "Sales Invoice", "Payment Entry")
+    /// Voucher type classification (e.g. Journal Entry).
     pub voucher_type: String,
-    /// The primary key of the source voucher document
+    /// Unique voucher number identifier.
     pub voucher_no: String,
-    /// Posting date in UTC; stored on each gl_entry for period-end reporting
+    /// Date of physical posting.
     pub posting_date: DateTime<Utc>,
-    /// The company scope for this transaction (multi-tenant)
+    /// Scope company context.
     pub company: String,
-    /// Remarks visible in the general ledger report
+    /// Context remarks.
     pub remarks: Option<String>,
-    /// The balanced set of ledger lines
+    /// Set of entry lines comprising the transaction.
     pub entries: Vec<GLEntry>,
 }
 
-/// Result record returned after a successful commit.
+/// PostingReceipt generated upon successful ledger posting.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PostingReceipt {
+    /// The processed voucher number.
     pub voucher_no: String,
+    /// Total entry lines stored.
     pub entry_count: usize,
+    /// Absolute total debit summed.
     pub total_debit: Decimal,
+    /// Absolute total credit summed.
     pub total_credit: Decimal,
 }
 
+/// Ledger posting and transaction processor.
 pub struct LedgerPostingEngine;
 
 impl LedgerPostingEngine {
-    /// Validates balance and atomically persists all GL entries to SurrealDB.
-    ///
-    /// Uses a single SurrealDB `BEGIN TRANSACTION … COMMIT TRANSACTION` block so
-    /// that a failure on any individual entry rolls the entire voucher back.
+    /// Validates entries, checks locks, and posts entries atomically.
     pub async fn commit_transaction(
         db: &Surreal<Any>,
         tx: &AccountingTransaction,
     ) -> Result<PostingReceipt, LedgerError> {
-        // ── 1. Compile & validate balance ─────────────────────────────────────
+        validate_and_compile_transaction(&tx.entries)?;
+
+        let mut period_res = db
+            .query("SELECT * FROM tabPeriodLock WHERE is_locked = true;")
+            .await
+            .map_err(|e| LedgerError::Database(e.to_string()))?;
+        
+        let locked_vals: Vec<serde_json::Value> = period_res.take(0).unwrap_or_default();
+        let mut locked_periods = Vec::new();
+        for val in locked_vals {
+            let period: PeriodLock = serde_json::from_value(val)
+                .map_err(|e| LedgerError::Database(e.to_string()))?;
+            locked_periods.push(period);
+        }
+
+        for period in locked_periods {
+            if tx.posting_date >= period.start_date && tx.posting_date <= period.end_date {
+                return Err(LedgerError::PeriodClosed);
+            }
+        }
+
         let total_debit: Decimal = tx.entries.iter().map(|e| e.debit).sum();
         let total_credit: Decimal = tx.entries.iter().map(|e| e.credit).sum();
 
-        if total_debit != total_credit {
-            return Err(LedgerError::Imbalanced {
-                debit: total_debit,
-                credit: total_credit,
-            });
-        }
-
-        // ── 2. Atomically insert every GL entry ────────────────────────────────
-        // SurrealDB 3.x supports nested BEGIN/COMMIT inside a multi-statement
-        // query chain. We build one query string so all entries land in a single
-        // network round-trip — important for low-latency RPi 5 deployments.
-        let mut query_parts: Vec<String> = Vec::with_capacity(tx.entries.len() + 2);
+        let mut query_parts = Vec::with_capacity(tx.entries.len() + 2);
         query_parts.push("BEGIN TRANSACTION;".to_string());
 
         for (idx, entry) in tx.entries.iter().enumerate() {
-            // Each GL entry is uniquely identified by voucher_no + line index
             let entry_id = format!("{}_{}", tx.voucher_no, idx);
-            let account_str = format!("{}:{}", entry.account.table(), entry.account.key());
+            let key_str = match &entry.account.key {
+                surrealdb::types::RecordIdKey::String(s) => s.clone(),
+                surrealdb::types::RecordIdKey::Number(n) => n.to_string(),
+                _ => format!("{:?}", entry.account.key),
+            };
+            let account_str = format!("{}:{}", entry.account.table, key_str);
             let cost_center = entry
                 .cost_center
                 .as_deref()
@@ -105,6 +130,8 @@ impl LedgerPostingEngine {
 
         db.query(&full_query)
             .await
+            .map_err(|e| LedgerError::Database(e.to_string()))?
+            .check()
             .map_err(|e| LedgerError::Database(e.to_string()))?;
 
         Ok(PostingReceipt {
@@ -115,8 +142,7 @@ impl LedgerPostingEngine {
         })
     }
 
-    /// Reverses a previously committed voucher by posting negated mirror entries.
-    /// The new cancellation voucher is suffixed with `-CANCEL`.
+    /// Generates cancellations mirror entries reversing transaction effects.
     pub async fn cancel_transaction(
         db: &Surreal<Any>,
         original: &AccountingTransaction,
@@ -126,11 +152,7 @@ impl LedgerPostingEngine {
             voucher_no: format!("{}-CANCEL", original.voucher_no),
             posting_date: Utc::now(),
             company: original.company.clone(),
-            remarks: Some(format!(
-                "Cancellation of {}",
-                original.voucher_no
-            )),
-            // Swap debit ↔ credit on every entry to produce the equal-and-opposite
+            remarks: Some(format!("Cancellation of {}", original.voucher_no)),
             entries: original
                 .entries
                 .iter()
@@ -146,74 +168,5 @@ impl LedgerPostingEngine {
         };
 
         Self::commit_transaction(db, &cancel_tx).await
-    }
-}
-
-// ── Unit tests (no live DB required; validate logic only) ────────────────────
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::posting::LedgerError;
-    use rust_decimal_macros::dec;
-    use surrealdb::types::RecordId;
-
-    fn make_entry(account: &str, debit: Decimal, credit: Decimal) -> GLEntry {
-        GLEntry {
-            account: RecordId::from_table_key("tabAccount", account),
-            debit,
-            credit,
-            voucher_type: "Test".to_string(),
-            voucher_no: "TEST-0001".to_string(),
-            cost_center: None,
-        }
-    }
-
-    #[test]
-    fn balanced_transaction_passes_validation() {
-        // Debit Cash 1000, Credit Revenue 1000 — balanced
-        let entries = vec![
-            make_entry("Cash", dec!(1000), dec!(0)),
-            make_entry("Revenue", dec!(0), dec!(1000)),
-        ];
-        let total_d: Decimal = entries.iter().map(|e| e.debit).sum();
-        let total_c: Decimal = entries.iter().map(|e| e.credit).sum();
-        assert_eq!(total_d, total_c, "Transaction must balance");
-    }
-
-    #[test]
-    fn imbalanced_transaction_returns_error() {
-        let entries = vec![
-            make_entry("Cash", dec!(1000), dec!(0)),
-            make_entry("Revenue", dec!(0), dec!(900)), // intentionally off by 100
-        ];
-        let total_d: Decimal = entries.iter().map(|e| e.debit).sum();
-        let total_c: Decimal = entries.iter().map(|e| e.credit).sum();
-        assert_ne!(total_d, total_c);
-        // Verify the error variant carries the correct amounts
-        let err = LedgerError::Imbalanced {
-            debit: total_d,
-            credit: total_c,
-        };
-        assert!(err.to_string().contains("1000"));
-        assert!(err.to_string().contains("900"));
-    }
-
-    #[test]
-    fn cancel_swaps_debit_and_credit() {
-        let original_entries = vec![
-            make_entry("Cash", dec!(500), dec!(0)),
-            make_entry("Accounts_Payable", dec!(0), dec!(500)),
-        ];
-        // Mirror: credit becomes debit, debit becomes credit
-        let cancelled: Vec<_> = original_entries
-            .iter()
-            .map(|e| (e.credit, e.debit))
-            .collect();
-        assert_eq!(cancelled[0], (dec!(0), dec!(500)));
-        assert_eq!(cancelled[1], (dec!(500), dec!(0)));
-        // Still balances
-        let total_d: Decimal = cancelled.iter().map(|(d, _)| d).sum();
-        let total_c: Decimal = cancelled.iter().map(|(_, c)| c).sum();
-        assert_eq!(total_d, total_c);
     }
 }

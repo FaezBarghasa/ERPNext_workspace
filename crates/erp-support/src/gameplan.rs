@@ -6,7 +6,6 @@
 use serde::{Deserialize, Serialize};
 use surrealdb::Surreal;
 use surrealdb::engine::any::Any;
-use surrealdb::types::RecordId;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
